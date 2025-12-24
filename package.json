@@ -1,0 +1,17 @@
+{
+  "name": "claude-cloud",
+  "version": "1.0.0",
+  "description": "Claude Code with web UI, GitHub integration, and webhook API",
+  "main": "webhook-server.js",
+  "scripts": {
+    "start": "node webhook-server.js",
+    "init-user": "node init-user.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "better-sqlite3": "^11.1.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
