@@ -3,10 +3,43 @@ set -e
 
 echo "=== Claude-Flow Container Starting ==="
 
+# Validate required credentials
+validate_required_env() {
+    local missing=()
+
+    # Check for Claude authentication
+    if [ -z "$CLAUDE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+        missing+=("CLAUDE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
+    fi
+
+    # Check for UI credentials (required for security)
+    if [ -z "$CLAUDE_UI_USER" ] || [ -z "$CLAUDE_UI_PASSWORD" ]; then
+        echo "ERROR: CLAUDE_UI_USER and CLAUDE_UI_PASSWORD are required!"
+        echo "These credentials are used to secure the web UI."
+        echo "Generate a secure password with: openssl rand -base64 32"
+        exit 1
+    fi
+
+    # Warn about minimum password length
+    if [ ${#CLAUDE_UI_PASSWORD} -lt 12 ]; then
+        echo "WARNING: CLAUDE_UI_PASSWORD should be at least 12 characters for security"
+    fi
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "WARNING: Missing recommended environment variables:"
+        printf '  - %s\n' "${missing[@]}"
+    fi
+}
+
+validate_required_env
+
 # Configure Claude OAuth authentication
 if [ -n "$CLAUDE_OAUTH_TOKEN" ]; then
     echo "Configuring Claude OAuth authentication..."
     mkdir -p /root/.claude
+
+    # Set secure permissions on .claude directory
+    chmod 700 /root/.claude
 
     # Build the credentials JSON with OAuth tokens
     cat > /root/.claude/credentials.json << EOF
@@ -19,12 +52,16 @@ if [ -n "$CLAUDE_OAUTH_TOKEN" ]; then
 }
 EOF
 
-    echo "Claude OAuth configured"
+    # Secure credentials file - owner read/write only
+    chmod 600 /root/.claude/credentials.json
+
+    echo "Claude OAuth configured (credentials secured)"
 elif [ -n "$ANTHROPIC_API_KEY" ]; then
     echo "Using API key authentication (legacy mode)"
 else
-    echo "WARNING: No Claude authentication configured!"
+    echo "ERROR: No Claude authentication configured!"
     echo "Set CLAUDE_OAUTH_TOKEN for OAuth or ANTHROPIC_API_KEY for legacy auth"
+    exit 1
 fi
 
 # Configure GitHub CLI if token provided

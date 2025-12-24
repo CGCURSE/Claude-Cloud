@@ -3,38 +3,336 @@ const https = require('https');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
+// ============================================
+// Configuration
+// ============================================
 const PORT = process.env.WEBHOOK_PORT || 8080;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const CREDENTIALS_PATH = '/root/.claude/credentials.json';
 const TOKEN_REFRESH_BUFFER = 5 * 60 * 1000; // Refresh 5 minutes before expiry
+const TASK_DB_PATH = process.env.TASK_DB_PATH || '/root/.claude-flow/tasks.db';
 
-// Task queue
-const taskQueue = [];
-const taskResults = new Map();
-let taskIdCounter = 1;
+// Task configuration
+const DEFAULT_TASK_TIMEOUT = parseInt(process.env.TASK_TIMEOUT_MS) || 10 * 60 * 1000; // 10 minutes default
+const MAX_PROMPT_LENGTH = parseInt(process.env.MAX_PROMPT_LENGTH) || 50000;
+const MAX_TASKS_HISTORY = parseInt(process.env.MAX_TASKS_HISTORY) || 1000;
+
+// Rate limiting configuration
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute window
+const RATE_LIMIT_MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX) || 60; // 60 requests per minute per IP
+const rateLimitStore = new Map();
+
+// ============================================
+// Logging
+// ============================================
+const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
+const LOG_LEVEL = LOG_LEVELS[process.env.LOG_LEVEL] ?? LOG_LEVELS.info;
+
+function log(level, message, meta = {}) {
+    if (LOG_LEVELS[level] > LOG_LEVEL) return;
+
+    const entry = {
+        timestamp: new Date().toISOString(),
+        level,
+        message,
+        ...meta
+    };
+    console.log(JSON.stringify(entry));
+}
+
+// ============================================
+// SQLite Task Persistence
+// ============================================
+let db = null;
+
+function initDatabase() {
+    try {
+        const Database = require('better-sqlite3');
+
+        // Ensure directory exists
+        const dbDir = path.dirname(TASK_DB_PATH);
+        if (!fs.existsSync(dbDir)) {
+            fs.mkdirSync(dbDir, { recursive: true, mode: 0o700 });
+        }
+
+        db = new Database(TASK_DB_PATH);
+
+        // Create tasks table with indexes
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'pending',
+                prompt TEXT,
+                type TEXT DEFAULT 'task',
+                cwd TEXT,
+                callback_url TEXT,
+                stdout TEXT,
+                stderr TEXT,
+                error TEXT,
+                exit_code INTEGER,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
+        `);
+
+        // Cleanup old tasks periodically (keep last MAX_TASKS_HISTORY)
+        setInterval(cleanupOldTasks, 60 * 60 * 1000); // Every hour
+
+        log('info', 'Task database initialized', { path: TASK_DB_PATH });
+        return true;
+    } catch (e) {
+        log('warn', 'SQLite not available, using in-memory storage', { error: e.message });
+        return false;
+    }
+}
+
+function cleanupOldTasks() {
+    if (!db) return;
+    try {
+        const result = db.prepare(`
+            DELETE FROM tasks WHERE task_id NOT IN (
+                SELECT task_id FROM tasks ORDER BY created_at DESC LIMIT ?
+            )
+        `).run(MAX_TASKS_HISTORY);
+        if (result.changes > 0) {
+            log('info', 'Cleaned up old tasks', { deleted: result.changes });
+        }
+    } catch (e) {
+        log('error', 'Failed to cleanup tasks', { error: e.message });
+    }
+}
+
+// In-memory fallback
+const taskResultsMemory = new Map();
+
+function saveTask(taskId, data) {
+    if (db) {
+        try {
+            const stmt = db.prepare(`
+                INSERT INTO tasks (task_id, status, prompt, type, cwd, callback_url, stdout, stderr, error, exit_code, started_at, completed_at)
+                VALUES (@task_id, @status, @prompt, @type, @cwd, @callback_url, @stdout, @stderr, @error, @exit_code, @started_at, @completed_at)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    status = @status,
+                    stdout = @stdout,
+                    stderr = @stderr,
+                    error = @error,
+                    exit_code = @exit_code,
+                    completed_at = @completed_at
+            `);
+            stmt.run({
+                task_id: taskId,
+                status: data.status || 'pending',
+                prompt: data.prompt || null,
+                type: data.type || 'task',
+                cwd: data.cwd || null,
+                callback_url: data.callbackUrl || null,
+                stdout: data.stdout || null,
+                stderr: data.stderr || null,
+                error: data.error || null,
+                exit_code: data.exitCode ?? null,
+                started_at: data.startedAt || null,
+                completed_at: data.completedAt || null
+            });
+        } catch (e) {
+            log('error', 'Failed to save task to database', { taskId, error: e.message });
+            taskResultsMemory.set(taskId, data);
+        }
+    } else {
+        taskResultsMemory.set(taskId, data);
+    }
+}
+
+function getTask(taskId) {
+    if (db) {
+        try {
+            const row = db.prepare('SELECT * FROM tasks WHERE task_id = ?').get(taskId);
+            if (row) {
+                return {
+                    taskId: row.task_id,
+                    status: row.status,
+                    prompt: row.prompt,
+                    type: row.type,
+                    cwd: row.cwd,
+                    callbackUrl: row.callback_url,
+                    stdout: row.stdout,
+                    stderr: row.stderr,
+                    error: row.error,
+                    exitCode: row.exit_code,
+                    startedAt: row.started_at,
+                    completedAt: row.completed_at
+                };
+            }
+        } catch (e) {
+            log('error', 'Failed to get task from database', { taskId, error: e.message });
+        }
+    }
+    return taskResultsMemory.get(taskId);
+}
+
+function getRecentTasks(limit = 50) {
+    if (db) {
+        try {
+            const rows = db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?').all(limit);
+            return rows.map(row => ({
+                taskId: row.task_id,
+                status: row.status,
+                type: row.type,
+                startedAt: row.started_at,
+                completedAt: row.completed_at
+            }));
+        } catch (e) {
+            log('error', 'Failed to get recent tasks', { error: e.message });
+        }
+    }
+    return Array.from(taskResultsMemory.values()).slice(-limit);
+}
+
+function getTaskStats() {
+    if (db) {
+        try {
+            const stats = db.prepare(`
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) as running,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                    SUM(CASE WHEN status = 'timeout' THEN 1 ELSE 0 END) as timeout
+                FROM tasks
+            `).get();
+            return stats;
+        } catch (e) {
+            log('error', 'Failed to get task stats', { error: e.message });
+        }
+    }
+    const tasks = Array.from(taskResultsMemory.values());
+    return {
+        total: tasks.length,
+        running: tasks.filter(t => t.status === 'running').length,
+        completed: tasks.filter(t => t.status === 'completed').length,
+        failed: tasks.filter(t => t.status === 'failed').length,
+        timeout: tasks.filter(t => t.status === 'timeout').length
+    };
+}
+
+// ============================================
+// Input Validation
+// ============================================
+function validatePrompt(prompt) {
+    if (typeof prompt !== 'string') {
+        return { valid: false, error: 'Prompt must be a string' };
+    }
+    if (prompt.trim().length === 0) {
+        return { valid: false, error: 'Prompt cannot be empty' };
+    }
+    if (prompt.length > MAX_PROMPT_LENGTH) {
+        return { valid: false, error: `Prompt exceeds maximum length of ${MAX_PROMPT_LENGTH} characters` };
+    }
+    return { valid: true };
+}
+
+function validateCwd(cwd) {
+    if (!cwd) return { valid: true, value: '/workspace' };
+
+    if (typeof cwd !== 'string') {
+        return { valid: false, error: 'cwd must be a string' };
+    }
+
+    // Prevent path traversal attacks
+    const resolved = path.resolve(cwd);
+    const allowedPaths = ['/workspace', '/tmp', '/home'];
+
+    if (!allowedPaths.some(allowed => resolved.startsWith(allowed))) {
+        return { valid: false, error: 'cwd must be within allowed directories' };
+    }
+
+    return { valid: true, value: resolved };
+}
+
+function validateCallbackUrl(url) {
+    if (!url) return { valid: true, value: null };
+
+    try {
+        const parsed = new URL(url);
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+            return { valid: false, error: 'Callback URL must use http or https' };
+        }
+        return { valid: true, value: url };
+    } catch (e) {
+        return { valid: false, error: 'Invalid callback URL' };
+    }
+}
+
+// ============================================
+// Rate Limiting
+// ============================================
+function getRateLimitKey(req) {
+    // Use X-Forwarded-For if behind a proxy, otherwise use socket address
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+        return forwarded.split(',')[0].trim();
+    }
+    return req.socket.remoteAddress || 'unknown';
+}
+
+function checkRateLimit(req) {
+    const key = getRateLimitKey(req);
+    const now = Date.now();
+
+    let record = rateLimitStore.get(key);
+    if (!record || now - record.windowStart > RATE_LIMIT_WINDOW) {
+        record = { windowStart: now, count: 0 };
+    }
+
+    record.count++;
+    rateLimitStore.set(key, record);
+
+    const remaining = Math.max(0, RATE_LIMIT_MAX_REQUESTS - record.count);
+    const reset = Math.ceil((record.windowStart + RATE_LIMIT_WINDOW - now) / 1000);
+
+    return {
+        allowed: record.count <= RATE_LIMIT_MAX_REQUESTS,
+        remaining,
+        reset,
+        limit: RATE_LIMIT_MAX_REQUESTS
+    };
+}
+
+// Clean up old rate limit entries periodically
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, record] of rateLimitStore.entries()) {
+        if (now - record.windowStart > RATE_LIMIT_WINDOW * 2) {
+            rateLimitStore.delete(key);
+        }
+    }
+}, RATE_LIMIT_WINDOW);
 
 // ============================================
 // OAuth Token Management
 // ============================================
-
 function readCredentials() {
     try {
         if (fs.existsSync(CREDENTIALS_PATH)) {
             return JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
         }
     } catch (e) {
-        console.error('Failed to read credentials:', e.message);
+        log('error', 'Failed to read credentials', { error: e.message });
     }
     return null;
 }
 
 function writeCredentials(credentials) {
     try {
-        fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(credentials, null, 2));
+        fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(credentials, null, 2), { mode: 0o600 });
         return true;
     } catch (e) {
-        console.error('Failed to write credentials:', e.message);
+        log('error', 'Failed to write credentials', { error: e.message });
         return false;
     }
 }
@@ -51,7 +349,7 @@ function isTokenExpiringSoon() {
 async function refreshOAuthToken() {
     const creds = readCredentials();
     if (!creds?.claudeAiOauth?.refreshToken) {
-        console.log('No refresh token available');
+        log('warn', 'No refresh token available');
         return false;
     }
 
@@ -61,7 +359,7 @@ async function refreshOAuthToken() {
         const postData = JSON.stringify({
             grant_type: 'refresh_token',
             refresh_token: refreshToken,
-            client_id: 'claude-code'
+            client_id: process.env.OAUTH_CLIENT_ID || 'claude-code'
         });
 
         const options = {
@@ -90,21 +388,21 @@ async function refreshOAuthToken() {
                             }
                         };
                         writeCredentials(newCreds);
-                        console.log('OAuth token refreshed successfully');
+                        log('info', 'OAuth token refreshed successfully');
                         resolve(true);
                     } else {
-                        console.error('Token refresh failed:', res.statusCode, data);
+                        log('error', 'Token refresh failed', { statusCode: res.statusCode });
                         resolve(false);
                     }
                 } catch (e) {
-                    console.error('Token refresh parse error:', e.message);
+                    log('error', 'Token refresh parse error', { error: e.message });
                     resolve(false);
                 }
             });
         });
 
         req.on('error', (e) => {
-            console.error('Token refresh request error:', e.message);
+            log('error', 'Token refresh request error', { error: e.message });
             resolve(false);
         });
 
@@ -113,10 +411,9 @@ async function refreshOAuthToken() {
     });
 }
 
-// Check and refresh token periodically
 async function checkAndRefreshToken() {
     if (isTokenExpiringSoon()) {
-        console.log('Token expiring soon, attempting refresh...');
+        log('info', 'Token expiring soon, attempting refresh...');
         await refreshOAuthToken();
     }
 }
@@ -127,7 +424,6 @@ setInterval(checkAndRefreshToken, 60 * 1000);
 // ============================================
 // Webhook Callback System
 // ============================================
-
 async function sendCallback(callbackUrl, payload, retries = 3) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
@@ -142,6 +438,7 @@ async function sendCallback(callbackUrl, payload, retries = 3) {
                 port: url.port || (isHttps ? 443 : 80),
                 path: url.pathname + url.search,
                 method: 'POST',
+                timeout: 30000, // 30 second timeout for callbacks
                 headers: {
                     'Content-Type': 'application/json',
                     'Content-Length': Buffer.byteLength(postData),
@@ -155,7 +452,7 @@ async function sendCallback(callbackUrl, payload, retries = 3) {
                     res.on('data', chunk => data += chunk);
                     res.on('end', () => {
                         if (res.statusCode >= 200 && res.statusCode < 300) {
-                            console.log(`Callback sent to ${callbackUrl}: ${res.statusCode}`);
+                            log('info', 'Callback sent successfully', { url: callbackUrl, statusCode: res.statusCode });
                             resolve();
                         } else {
                             reject(new Error(`Callback failed: ${res.statusCode}`));
@@ -163,52 +460,74 @@ async function sendCallback(callbackUrl, payload, retries = 3) {
                     });
                 });
 
+                req.on('timeout', () => {
+                    req.destroy();
+                    reject(new Error('Callback request timeout'));
+                });
+
                 req.on('error', reject);
                 req.write(postData);
                 req.end();
             });
 
-            return true; // Success
+            return true;
         } catch (e) {
-            console.error(`Callback attempt ${attempt}/${retries} failed:`, e.message);
+            log('warn', `Callback attempt ${attempt}/${retries} failed`, { url: callbackUrl, error: e.message });
             if (attempt < retries) {
-                // Exponential backoff: 1s, 2s, 4s
                 await new Promise(r => setTimeout(r, Math.pow(2, attempt - 1) * 1000));
             }
         }
     }
-    console.error(`All callback attempts to ${callbackUrl} failed`);
+    log('error', 'All callback attempts failed', { url: callbackUrl });
     return false;
 }
 
 // ============================================
 // Task Execution
 // ============================================
-
 function generateTaskId() {
-    return `task_${Date.now()}_${taskIdCounter++}`;
+    return `task_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 }
+
+// Track running processes for cleanup
+const runningProcesses = new Map();
 
 function runTask(taskId, prompt, options = {}) {
     return new Promise((resolve, reject) => {
-        // Check token before running task
         checkAndRefreshToken();
 
+        const timeout = options.timeout || DEFAULT_TASK_TIMEOUT;
         const args = ['--dangerously-skip-permissions'];
 
-        if (options.cwd) {
-            process.chdir(options.cwd);
-        }
+        const cwd = options.cwd || '/workspace';
+
+        log('info', 'Starting task', { taskId, cwd, timeout });
 
         const claude = spawn('claude', args, {
-            cwd: options.cwd || '/workspace',
+            cwd,
             env: { ...process.env, ...options.env }
         });
 
+        runningProcesses.set(taskId, claude);
+
         let stdout = '';
         let stderr = '';
+        let timedOut = false;
 
-        // Send prompt to Claude
+        // Set up timeout
+        const timeoutHandle = setTimeout(() => {
+            timedOut = true;
+            log('warn', 'Task timeout, killing process', { taskId, timeout });
+            claude.kill('SIGTERM');
+
+            // Force kill after 5 seconds if still running
+            setTimeout(() => {
+                if (!claude.killed) {
+                    claude.kill('SIGKILL');
+                }
+            }, 5000);
+        }, timeout);
+
         claude.stdin.write(prompt);
         claude.stdin.end();
 
@@ -221,17 +540,22 @@ function runTask(taskId, prompt, options = {}) {
         });
 
         claude.on('close', async (code) => {
+            clearTimeout(timeoutHandle);
+            runningProcesses.delete(taskId);
+
             const result = {
                 taskId,
-                status: code === 0 ? 'completed' : 'failed',
+                status: timedOut ? 'timeout' : (code === 0 ? 'completed' : 'failed'),
                 exitCode: code,
                 stdout,
                 stderr,
                 completedAt: new Date().toISOString()
             };
-            taskResults.set(taskId, result);
 
-            // Send callback if URL was provided
+            saveTask(taskId, result);
+
+            log('info', 'Task completed', { taskId, status: result.status, exitCode: code });
+
             if (options.callbackUrl) {
                 result.callbackSent = await sendCallback(options.callbackUrl, result);
             }
@@ -240,15 +564,20 @@ function runTask(taskId, prompt, options = {}) {
         });
 
         claude.on('error', async (err) => {
+            clearTimeout(timeoutHandle);
+            runningProcesses.delete(taskId);
+
             const result = {
                 taskId,
                 status: 'error',
                 error: err.message,
                 completedAt: new Date().toISOString()
             };
-            taskResults.set(taskId, result);
 
-            // Send callback on error too
+            saveTask(taskId, result);
+
+            log('error', 'Task error', { taskId, error: err.message });
+
             if (options.callbackUrl) {
                 result.callbackSent = await sendCallback(options.callbackUrl, result);
             }
@@ -258,14 +587,31 @@ function runTask(taskId, prompt, options = {}) {
     });
 }
 
+// Graceful shutdown - cleanup running processes
+process.on('SIGTERM', () => {
+    log('info', 'Received SIGTERM, cleaning up...');
+    for (const [taskId, proc] of runningProcesses.entries()) {
+        log('info', 'Killing running task', { taskId });
+        proc.kill('SIGTERM');
+    }
+    setTimeout(() => process.exit(0), 5000);
+});
+
 // ============================================
 // HTTP Server
 // ============================================
-
 function parseBody(req) {
     return new Promise((resolve, reject) => {
         let body = '';
-        req.on('data', chunk => body += chunk);
+        const maxBodySize = 1024 * 1024; // 1MB max body size
+
+        req.on('data', chunk => {
+            body += chunk;
+            if (body.length > maxBodySize) {
+                reject(new Error('Request body too large'));
+            }
+        });
+
         req.on('end', () => {
             try {
                 resolve(body ? JSON.parse(body) : {});
@@ -276,8 +622,16 @@ function parseBody(req) {
     });
 }
 
-function sendJSON(res, status, data) {
-    res.writeHead(status, { 'Content-Type': 'application/json' });
+function sendJSON(res, status, data, rateLimit = null) {
+    const headers = { 'Content-Type': 'application/json' };
+
+    if (rateLimit) {
+        headers['X-RateLimit-Limit'] = rateLimit.limit;
+        headers['X-RateLimit-Remaining'] = rateLimit.remaining;
+        headers['X-RateLimit-Reset'] = rateLimit.reset;
+    }
+
+    res.writeHead(status, headers);
     res.end(JSON.stringify(data));
 }
 
@@ -285,7 +639,12 @@ function validateSecret(req) {
     if (!WEBHOOK_SECRET) return true;
     const authHeader = req.headers['authorization'] || '';
     const token = authHeader.replace('Bearer ', '');
-    return token === WEBHOOK_SECRET;
+    // Use timing-safe comparison to prevent timing attacks
+    try {
+        return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(WEBHOOK_SECRET));
+    } catch {
+        return false;
+    }
 }
 
 function getAuthStatus() {
@@ -307,6 +666,7 @@ function getAuthStatus() {
 
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${PORT}`);
+    const requestId = crypto.randomBytes(4).toString('hex');
 
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -318,19 +678,35 @@ const server = http.createServer(async (req, res) => {
         return res.end();
     }
 
-    // Health check (includes auth status)
+    // Apply rate limiting to all endpoints except health
+    let rateLimit = null;
+    if (url.pathname !== '/health') {
+        rateLimit = checkRateLimit(req);
+        if (!rateLimit.allowed) {
+            log('warn', 'Rate limit exceeded', { ip: getRateLimitKey(req), path: url.pathname });
+            return sendJSON(res, 429, {
+                error: 'Too many requests',
+                retryAfter: rateLimit.reset
+            }, rateLimit);
+        }
+    }
+
+    // Health check (includes auth status and task stats)
     if (url.pathname === '/health') {
         return sendJSON(res, 200, {
             status: 'healthy',
             timestamp: new Date().toISOString(),
-            pendingTasks: taskQueue.length,
+            version: '2.0.0',
+            storage: db ? 'sqlite' : 'memory',
+            taskStats: getTaskStats(),
             auth: getAuthStatus()
         });
     }
 
     // Validate auth for other endpoints
     if (!validateSecret(req)) {
-        return sendJSON(res, 401, { error: 'Unauthorized' });
+        log('warn', 'Unauthorized request', { path: url.pathname, ip: getRateLimitKey(req) });
+        return sendJSON(res, 401, { error: 'Unauthorized' }, rateLimit);
     }
 
     // Manual token refresh endpoint
@@ -339,7 +715,7 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, success ? 200 : 500, {
             success,
             auth: getAuthStatus()
-        });
+        }, rateLimit);
     }
 
     // Submit task
@@ -347,61 +723,94 @@ const server = http.createServer(async (req, res) => {
         try {
             const body = await parseBody(req);
 
-            if (!body.prompt) {
-                return sendJSON(res, 400, { error: 'Missing prompt' });
+            // Validate prompt
+            const promptValidation = validatePrompt(body.prompt);
+            if (!promptValidation.valid) {
+                return sendJSON(res, 400, { error: promptValidation.error }, rateLimit);
+            }
+
+            // Validate cwd
+            const cwdValidation = validateCwd(body.cwd);
+            if (!cwdValidation.valid) {
+                return sendJSON(res, 400, { error: cwdValidation.error }, rateLimit);
+            }
+
+            // Validate callback URL
+            const callbackValidation = validateCallbackUrl(body.callback_url);
+            if (!callbackValidation.valid) {
+                return sendJSON(res, 400, { error: callbackValidation.error }, rateLimit);
             }
 
             const taskId = generateTaskId();
+            const timeout = Math.min(
+                parseInt(body.timeout) || DEFAULT_TASK_TIMEOUT,
+                30 * 60 * 1000 // Max 30 minutes
+            );
+
             const options = {
-                cwd: body.cwd || '/workspace',
+                cwd: cwdValidation.value,
                 env: body.env || {},
-                callbackUrl: body.callback_url || null
+                callbackUrl: callbackValidation.value,
+                timeout
             };
 
             // Store initial task status
-            taskResults.set(taskId, {
+            saveTask(taskId, {
                 taskId,
                 status: 'running',
                 prompt: body.prompt,
                 callbackUrl: options.callbackUrl,
+                cwd: options.cwd,
                 startedAt: new Date().toISOString()
             });
 
+            log('info', 'Task submitted', { taskId, async: !!body.async, requestId });
+
             // Run async (fire and forget if async: true)
             if (body.async) {
-                runTask(taskId, body.prompt, options).catch(console.error);
+                runTask(taskId, body.prompt, options).catch(e => {
+                    log('error', 'Async task failed', { taskId, error: e.message || e.error });
+                });
                 return sendJSON(res, 202, {
                     taskId,
                     status: 'accepted',
                     callbackUrl: options.callbackUrl
-                });
+                }, rateLimit);
             }
 
             // Run sync (wait for completion)
             const result = await runTask(taskId, body.prompt, options);
-            return sendJSON(res, 200, result);
+            return sendJSON(res, 200, result, rateLimit);
 
         } catch (e) {
-            return sendJSON(res, 500, { error: e.message });
+            log('error', 'Task submission error', { error: e.message, requestId });
+            return sendJSON(res, 500, { error: e.message }, rateLimit);
         }
     }
 
     // Get task status
     if (url.pathname.startsWith('/task/') && req.method === 'GET') {
         const taskId = url.pathname.replace('/task/', '');
-        const result = taskResults.get(taskId);
 
-        if (!result) {
-            return sendJSON(res, 404, { error: 'Task not found' });
+        // Validate task ID format
+        if (!/^task_\d+_[a-f0-9]+$/.test(taskId)) {
+            return sendJSON(res, 400, { error: 'Invalid task ID format' }, rateLimit);
         }
 
-        return sendJSON(res, 200, result);
+        const result = getTask(taskId);
+
+        if (!result) {
+            return sendJSON(res, 404, { error: 'Task not found' }, rateLimit);
+        }
+
+        return sendJSON(res, 200, result, rateLimit);
     }
 
     // List recent tasks
     if (url.pathname === '/tasks' && req.method === 'GET') {
-        const tasks = Array.from(taskResults.values()).slice(-50);
-        return sendJSON(res, 200, { tasks });
+        const limit = Math.min(parseInt(url.searchParams.get('limit')) || 50, 100);
+        const tasks = getRecentTasks(limit);
+        return sendJSON(res, 200, { tasks, stats: getTaskStats() }, rateLimit);
     }
 
     // Swarm command
@@ -409,32 +818,59 @@ const server = http.createServer(async (req, res) => {
         try {
             const body = await parseBody(req);
 
-            if (!body.task) {
-                return sendJSON(res, 400, { error: 'Missing task' });
+            if (!body.task || typeof body.task !== 'string' || body.task.trim().length === 0) {
+                return sendJSON(res, 400, { error: 'Missing or invalid task' }, rateLimit);
+            }
+
+            const cwdValidation = validateCwd(body.cwd);
+            if (!cwdValidation.valid) {
+                return sendJSON(res, 400, { error: cwdValidation.error }, rateLimit);
+            }
+
+            const callbackValidation = validateCallbackUrl(body.callback_url);
+            if (!callbackValidation.valid) {
+                return sendJSON(res, 400, { error: callbackValidation.error }, rateLimit);
             }
 
             const taskId = generateTaskId();
-            const callbackUrl = body.callback_url || null;
+            const callbackUrl = callbackValidation.value;
+
+            saveTask(taskId, {
+                taskId,
+                type: 'swarm',
+                status: 'running',
+                prompt: body.task,
+                cwd: cwdValidation.value,
+                callbackUrl,
+                startedAt: new Date().toISOString()
+            });
+
+            log('info', 'Swarm task submitted', { taskId });
 
             const swarm = spawn('claude-flow', ['swarm', body.task, '--claude'], {
-                cwd: body.cwd || '/workspace'
+                cwd: cwdValidation.value
             });
+
+            runningProcesses.set(taskId, swarm);
 
             let output = '';
             swarm.stdout.on('data', d => output += d);
             swarm.stderr.on('data', d => output += d);
 
             swarm.on('close', async (code) => {
+                runningProcesses.delete(taskId);
+
                 const result = {
                     taskId,
                     type: 'swarm',
                     status: code === 0 ? 'completed' : 'failed',
-                    output,
+                    stdout: output,
+                    exitCode: code,
                     completedAt: new Date().toISOString()
                 };
-                taskResults.set(taskId, result);
 
-                // Send callback if URL was provided
+                saveTask(taskId, result);
+
                 if (callbackUrl) {
                     result.callbackSent = await sendCallback(callbackUrl, result);
                 }
@@ -445,33 +881,43 @@ const server = http.createServer(async (req, res) => {
                     taskId,
                     status: 'accepted',
                     callbackUrl
-                });
+                }, rateLimit);
             }
 
             await new Promise(resolve => swarm.on('close', resolve));
-            return sendJSON(res, 200, taskResults.get(taskId));
+            return sendJSON(res, 200, getTask(taskId), rateLimit);
 
         } catch (e) {
-            return sendJSON(res, 500, { error: e.message });
+            log('error', 'Swarm submission error', { error: e.message });
+            return sendJSON(res, 500, { error: e.message }, rateLimit);
         }
     }
 
     // 404 for unknown routes
-    sendJSON(res, 404, { error: 'Not found' });
+    sendJSON(res, 404, { error: 'Not found' }, rateLimit);
 });
 
+// Initialize database and start server
+initDatabase();
+
 server.listen(PORT, () => {
+    log('info', 'Webhook server started', { port: PORT });
     console.log(`Webhook server listening on port ${PORT}`);
     console.log(`Endpoints:`);
-    console.log(`  GET  /health       - Health check (includes auth status)`);
+    console.log(`  GET  /health       - Health check (includes auth status & task stats)`);
     console.log(`  POST /auth/refresh - Manually refresh OAuth token`);
-    console.log(`  POST /task         - Submit Claude task (supports callback_url)`);
+    console.log(`  POST /task         - Submit Claude task (supports callback_url, timeout)`);
     console.log(`  GET  /task/:id     - Get task status`);
     console.log(`  GET  /tasks        - List recent tasks`);
     console.log(`  POST /swarm        - Run swarm task (supports callback_url)`);
     console.log('');
+    console.log('Configuration:');
+    console.log(`  Storage: ${db ? 'SQLite' : 'In-memory'}`);
+    console.log(`  Rate limit: ${RATE_LIMIT_MAX_REQUESTS} req/min`);
+    console.log(`  Task timeout: ${DEFAULT_TASK_TIMEOUT / 1000}s`);
+    console.log(`  Max prompt length: ${MAX_PROMPT_LENGTH} chars`);
+    console.log('');
     console.log('Auth status:', JSON.stringify(getAuthStatus()));
 
-    // Initial token check
     checkAndRefreshToken();
 });

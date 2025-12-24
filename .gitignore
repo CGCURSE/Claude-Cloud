@@ -1,0 +1,50 @@
+# Environment files (contain secrets)
+.env
+.env.local
+.env.*.local
+*.env
+
+# Credentials
+credentials.json
+*.pem
+*.key
+*.crt
+*.p12
+
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build outputs
+dist/
+build/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker
+.docker/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Claude-specific
+.claude-flow/
+.swarm/

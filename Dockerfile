@@ -71,8 +71,16 @@ ENV WEBHOOK_PORT=8080
 # 8080 = Webhook API
 EXPOSE 3001 8080
 
-# Health check against Claude Code UI
+# Create health check script that verifies both services
+RUN echo '#!/bin/bash\n\
+# Check Claude Code UI\n\
+curl -sf http://localhost:${PORT:-3001}/ > /dev/null || exit 1\n\
+# Check Webhook API\n\
+curl -sf http://localhost:${WEBHOOK_PORT:-8080}/health > /dev/null || exit 1\n\
+exit 0' > /app/healthcheck.sh && chmod +x /app/healthcheck.sh
+
+# Health check against both Claude Code UI and Webhook API
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/ || exit 1
+    CMD /app/healthcheck.sh
 
 ENTRYPOINT ["/app/entrypoint.sh"]
