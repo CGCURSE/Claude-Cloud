@@ -10,7 +10,6 @@ const CREDENTIALS_PATH = '/root/.claude/credentials.json';
 const TOKEN_REFRESH_BUFFER = 5 * 60 * 1000; // Refresh 5 minutes before expiry
 
 // Task queue
-const taskQueue = [];
 const taskResults = new Map();
 let taskIdCounter = 1;
 
@@ -323,7 +322,7 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 200, {
             status: 'healthy',
             timestamp: new Date().toISOString(),
-            pendingTasks: taskQueue.length,
+            pendingTasks: 0,
             auth: getAuthStatus()
         });
     }
@@ -347,8 +346,8 @@ const server = http.createServer(async (req, res) => {
         try {
             const body = await parseBody(req);
 
-            if (!body.prompt) {
-                return sendJSON(res, 400, { error: 'Missing prompt' });
+            if (!body.prompt || typeof body.prompt !== 'string' || body.prompt.trim() === '') {
+                return sendJSON(res, 400, { error: 'Missing prompt or invalid prompt format' });
             }
 
             const taskId = generateTaskId();

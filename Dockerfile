@@ -49,16 +49,17 @@ RUN mkdir -p \
 
 # Install dependencies for user initialization script
 WORKDIR /app
+COPY package.json /app/package.json
+RUN npm install
+
+# Copy application files
 COPY init-user.js /app/init-user.js
-RUN npm init -y && npm install better-sqlite3 bcrypt
-
-# Configure Claude Code for dangerously-skip-permissions mode
-RUN echo '{"permissions": {"allow_all": true}, "auto_approve": true}' > /root/.claude/settings.json
-
-# Copy webhook server and entrypoint
 COPY webhook-server.js /app/webhook-server.js
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# Configure Claude Code for dangerously-skip-permissions mode
+RUN echo '{"permissions": {"allow_all": true}, "auto_approve": true}' > /root/.claude/settings.json
 
 # Environment defaults
 ENV CLAUDE_CODE_SKIP_PERMISSIONS=1
