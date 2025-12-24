@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-venv \
     procps \
+    build-essential \
     && mkdir -p /etc/apt/keyrings \
     # GitHub CLI
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
@@ -41,9 +42,15 @@ WORKDIR /workspace
 RUN mkdir -p \
     /root/.claude-flow \
     /root/.claude/projects \
+    /root/.claude-code-ui \
     /root/.config/gh \
     /workspace/.swarm \
     /app
+
+# Install dependencies for user initialization script
+WORKDIR /app
+COPY init-user.js /app/init-user.js
+RUN npm init -y && npm install better-sqlite3 bcrypt
 
 # Configure Claude Code for dangerously-skip-permissions mode
 RUN echo '{"permissions": {"allow_all": true}, "auto_approve": true}' > /root/.claude/settings.json
