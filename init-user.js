@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Initialize Claude Code UI with a default user
- * Uses bcrypt (12 rounds) to match the UI's auth system
+ * Waits for the UI to create the database, then adds a default user
  */
 
 const Database = require('better-sqlite3');
@@ -13,83 +13,101 @@ const DB_PATH = process.env.DATABASE_PATH || '/root/.claude-code-ui/auth.db';
 const DEFAULT_USER = process.env.CLAUDE_UI_USER || 'admin';
 const DEFAULT_PASS = process.env.CLAUDE_UI_PASSWORD || 'admin';
 const SALT_ROUNDS = 12;
+const MAX_RETRIES = 30;
+const RETRY_DELAY = 2000; // 2 seconds
 
-// Ensure directory exists
-const dbDir = path.dirname(DB_PATH);
-if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir, { recursive: true });
+async function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Initialize database
-const db = new Database(DB_PATH);
-db.pragma('foreign_keys = ON');
+async function waitForDatabase() {
+    for (let i = 0; i < MAX_RETRIES; i++) {
+        if (fs.existsSync(DB_PATH)) {
+            try {
+                const db = new Database(DB_PATH, { readonly: true });
+                // Check if users table exists and has the right structure
+                const tableInfo = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get();
+                db.close();
 
-// Create tables
-db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        last_login DATETIME,
-        is_active BOOLEAN DEFAULT 1,
-        git_name TEXT,
-        git_email TEXT,
-        has_completed_onboarding BOOLEAN DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS api_keys (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        key_name TEXT NOT NULL,
-        key_hash TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        last_used DATETIME,
-        is_active BOOLEAN DEFAULT 1,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS user_credentials (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        credential_type TEXT NOT NULL,
-        credential_value TEXT NOT NULL,
-        description TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        is_active BOOLEAN DEFAULT 1,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-    CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active);
-    CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
-    CREATE INDEX IF NOT EXISTS idx_credentials_user ON user_credentials(user_id);
-`);
-
-// Check if users exist
-const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get();
-
-if (userCount.count === 0) {
-    console.log(`Creating default user: ${DEFAULT_USER}`);
-
-    const passwordHash = bcrypt.hashSync(DEFAULT_PASS, SALT_ROUNDS);
-
-    const stmt = db.prepare(`
-        INSERT INTO users (username, password_hash, has_completed_onboarding, git_name, git_email)
-        VALUES (?, ?, 1, ?, ?)
-    `);
-
-    stmt.run(
-        DEFAULT_USER,
-        passwordHash,
-        process.env.GIT_USER_NAME || '',
-        process.env.GIT_USER_EMAIL || ''
-    );
-
-    console.log(`Default user '${DEFAULT_USER}' created successfully`);
-    console.log(`Database: ${DB_PATH}`);
-} else {
-    console.log(`Users already exist in database, skipping initialization`);
+                if (tableInfo) {
+                    console.log(`Database found at ${DB_PATH}`);
+                    return true;
+                }
+            } catch (e) {
+                // Database might be locked or not ready
+            }
+        }
+        console.log(`Waiting for database... (${i + 1}/${MAX_RETRIES})`);
+        await sleep(RETRY_DELAY);
+    }
+    return false;
 }
 
-db.close();
+async function createDefaultUser() {
+    try {
+        const db = new Database(DB_PATH);
+
+        // Check if users exist
+        const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get();
+
+        if (userCount.count === 0) {
+            console.log(`Creating default user: ${DEFAULT_USER}`);
+
+            const passwordHash = bcrypt.hashSync(DEFAULT_PASS, SALT_ROUNDS);
+
+            // Get column info to handle schema variations
+            const columns = db.prepare("PRAGMA table_info(users)").all();
+            const columnNames = columns.map(c => c.name);
+
+            // Build insert statement based on available columns
+            const insertCols = ['username', 'password_hash'];
+            const insertVals = [DEFAULT_USER, passwordHash];
+
+            if (columnNames.includes('has_completed_onboarding')) {
+                insertCols.push('has_completed_onboarding');
+                insertVals.push(1);
+            }
+            if (columnNames.includes('is_active')) {
+                insertCols.push('is_active');
+                insertVals.push(1);
+            }
+            if (columnNames.includes('git_name') && process.env.GIT_USER_NAME) {
+                insertCols.push('git_name');
+                insertVals.push(process.env.GIT_USER_NAME);
+            }
+            if (columnNames.includes('git_email') && process.env.GIT_USER_EMAIL) {
+                insertCols.push('git_email');
+                insertVals.push(process.env.GIT_USER_EMAIL);
+            }
+
+            const placeholders = insertCols.map(() => '?').join(', ');
+            const stmt = db.prepare(`INSERT INTO users (${insertCols.join(', ')}) VALUES (${placeholders})`);
+            stmt.run(...insertVals);
+
+            console.log(`Default user '${DEFAULT_USER}' created successfully`);
+        } else {
+            console.log(`Users already exist in database, skipping initialization`);
+        }
+
+        db.close();
+        return true;
+    } catch (e) {
+        console.error('Failed to create default user:', e.message);
+        return false;
+    }
+}
+
+async function main() {
+    console.log('Waiting for Claude Code UI to initialize database...');
+
+    const dbReady = await waitForDatabase();
+
+    if (dbReady) {
+        await createDefaultUser();
+    } else {
+        console.log('Database not ready after timeout, skipping user creation');
+        console.log('You may need to complete the first-time setup manually');
+    }
+}
+
+main();
