@@ -3,6 +3,30 @@ set -e
 
 echo "=== Claude-Flow Container Starting ==="
 
+# Configure Claude OAuth authentication
+if [ -n "$CLAUDE_OAUTH_TOKEN" ]; then
+    echo "Configuring Claude OAuth authentication..."
+    mkdir -p /root/.claude
+
+    # Build the credentials JSON with OAuth tokens
+    cat > /root/.claude/credentials.json << EOF
+{
+  "claudeAiOauth": {
+    "accessToken": "$CLAUDE_OAUTH_TOKEN",
+    "refreshToken": "${CLAUDE_OAUTH_REFRESH_TOKEN:-}",
+    "expiresAt": ${CLAUDE_OAUTH_EXPIRES_AT:-0}
+  }
+}
+EOF
+
+    echo "Claude OAuth configured"
+elif [ -n "$ANTHROPIC_API_KEY" ]; then
+    echo "Using API key authentication (legacy mode)"
+else
+    echo "WARNING: No Claude authentication configured!"
+    echo "Set CLAUDE_OAUTH_TOKEN for OAuth or ANTHROPIC_API_KEY for legacy auth"
+fi
+
 # Configure GitHub CLI if token provided
 if [ -n "$GH_TOKEN" ]; then
     echo "Authenticating GitHub CLI..."

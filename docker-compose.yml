@@ -14,8 +14,13 @@ services:
     build: .
     container_name: claude-flow
     environment:
+      # Claude Authentication (OAuth preferred, API key as fallback)
+      - CLAUDE_OAUTH_TOKEN=${CLAUDE_OAUTH_TOKEN:-}
+      - CLAUDE_OAUTH_REFRESH_TOKEN=${CLAUDE_OAUTH_REFRESH_TOKEN:-}
+      - CLAUDE_OAUTH_EXPIRES_AT=${CLAUDE_OAUTH_EXPIRES_AT:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+
       # Required
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GH_TOKEN=${GH_TOKEN}
       
       # Git identity
