@@ -43,6 +43,11 @@ if [ -n "$GIT_USER_EMAIL" ]; then
     git config --global user.email "$GIT_USER_EMAIL"
 fi
 
+# Initialize Claude Code UI default user
+echo "Initializing Claude Code UI user..."
+export DATABASE_PATH="${DATABASE_PATH:-/root/.claude-code-ui/auth.db}"
+node /app/init-user.js
+
 # Initialize claude-flow
 echo "Initializing claude-flow..."
 claude-flow init --force 2>/dev/null || true

@@ -35,7 +35,11 @@ services:
       
       # Optional: Webhook auth (Bearer token)
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
-      
+
+      # Claude Code UI credentials (default: admin/admin)
+      - CLAUDE_UI_USER=${CLAUDE_UI_USER:-admin}
+      - CLAUDE_UI_PASSWORD=${CLAUDE_UI_PASSWORD:-admin}
+
       # Ports
       - PORT=3001
       - WEBHOOK_PORT=8080
